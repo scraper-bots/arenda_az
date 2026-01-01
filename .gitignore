@@ -3,3 +3,4 @@ scraper.log
 test_scraper.py
 __pycache__
 scraper_state.json
+venv

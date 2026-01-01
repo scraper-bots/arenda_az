@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-Arenda.az Real Estate Scraper - Complete Solution
-Robust scraper with crash recovery, retry logic, and statistics
-Usage:
-    python arenda_scraper.py scrape          # Start scraping
-    python arenda_scraper.py retry           # Retry failed listings
-    python arenda_scraper.py stats           # View statistics
+Arenda.az Real Estate Scraper
+Usage: python arenda_scraper.py
 """
 
 import asyncio
@@ -20,9 +16,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 import re
 import signal
-import sys
 from dataclasses import dataclass, asdict
-from collections import Counter
 
 # Configure logging
 logging.basicConfig(
@@ -362,19 +356,18 @@ class ArendaScraper:
             self.state.add_failed(listing_id, url)
             return None
 
-    async def _scrape_page(self, page: int) -> List[Listing]:
+    async def _scrape_page(self, page: int, total_pages: int, start_time: float, page_times: list) -> List[Listing]:
         if not self.running:
             return []
 
+        page_start = asyncio.get_event_loop().time()
         url = f"{self.base_url}/filtirli-axtaris/{page}/?home_search=1&lang=1&site=1&home_s=1"
-        logger.info(f"Scraping page {page}")
 
         html = await self._fetch_with_retry(url)
         if not html:
             return []
 
         listing_links = self._extract_listing_links(html)
-        logger.info(f"Found {len(listing_links)} listings on page {page}")
 
         if not listing_links:
             return []
@@ -383,8 +376,30 @@ class ArendaScraper:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         listings = [r for r in results if isinstance(r, Listing)]
 
+        # Calculate timing
+        page_time = asyncio.get_event_loop().time() - page_start
+        page_times.append(page_time)
+
+        # Calculate progress
+        pages_done = page
+        pages_left = total_pages - page
+        total_scraped = self.state.state['total_scraped']
+
+        # Calculate ETA
+        avg_time = sum(page_times) / len(page_times)
+        eta_seconds = avg_time * pages_left
+        eta_minutes = eta_seconds / 60
+
+        # Format ETA
+        if eta_minutes < 60:
+            eta_str = f"{eta_minutes:.1f}m"
+        else:
+            eta_hours = eta_minutes / 60
+            eta_str = f"{eta_hours:.1f}h"
+
+        logger.info(f"Page {page}/{total_pages} | Scraped: {len(listings)}/{len(listing_links)} | Total: {total_scraped} | Left: {pages_left} pages | ETA: {eta_str} | Avg: {avg_time:.1f}s/page")
+
         self.state.set_last_page(page)
-        logger.info(f"✓ Page {page}: {len(listings)}/{len(listing_links)} successful")
         return listings
 
     def _get_max_page(self, html: str) -> int:
@@ -400,170 +415,37 @@ class ArendaScraper:
             logger.error(f"Error extracting max page: {e}")
         return 1
 
-    async def scrape(self, start_page: int = 1, end_page: Optional[int] = None):
+    async def scrape(self, start_page: int = 1, end_page: Optional[int] = 554):
         """Main scraping method"""
         try:
             self.session = await self._create_session()
+            start_time = asyncio.get_event_loop().time()
+            page_times = []
 
             if self.state.state['last_page'] > 0:
-                start_page = self.state.state['last_page']
-                logger.info(f"Resuming from page {start_page}")
+                start_page = self.state.state['last_page'] + 1
+                logger.info(f"🔄 Resuming from page {start_page}")
 
-            if end_page is None:
-                first_page_html = await self._fetch_with_retry(
-                    f"{self.base_url}/filtirli-axtaris/1/?home_search=1&lang=1&site=1&home_s=1"
-                )
-                if first_page_html:
-                    end_page = self._get_max_page(first_page_html)
-                    logger.info(f"Detected {end_page} total pages")
-                else:
-                    end_page = 10
-
-            logger.info(f"Scraping pages {start_page} to {end_page}")
+            logger.info(f"🚀 Starting scrape: Page {start_page} to {end_page} ({end_page - start_page + 1} pages)")
 
             for page in range(start_page, end_page + 1):
                 if not self.running:
+                    logger.info("⏸️  Paused by user")
                     break
                 try:
-                    await self._scrape_page(page)
+                    await self._scrape_page(page, end_page, start_time, page_times)
                     await asyncio.sleep(1)
                 except Exception as e:
-                    logger.error(f"Error on page {page}: {e}")
+                    logger.error(f"❌ Error on page {page}: {e}")
 
-            logger.info(f"✓ Completed! Total: {self.state.state['total_scraped']}")
+            elapsed = asyncio.get_event_loop().time() - start_time
+            logger.info(f"✅ Completed! Total: {self.state.state['total_scraped']} | Time: {elapsed/60:.1f}m")
         finally:
             if self.session:
                 await self.session.close()
 
 
-async def retry_failed():
-    """Retry failed listings"""
-    state = ScraperState()
-    failed = state.state.get('failed_listings', [])
-
-    if not failed:
-        logger.info("No failed listings to retry")
-        return
-
-    logger.info(f"Retrying {len(failed)} failed listings")
-    scraper = ArendaScraper(max_concurrent=3)
-    scraper.session = await scraper._create_session()
-
-    success = 0
-    try:
-        for f in failed:
-            if f['id'] in state.state['processed_listings']:
-                state.state['processed_listings'].remove(f['id'])
-
-            result = await scraper._scrape_listing(f['id'], f['url'])
-            if result:
-                success += 1
-                state.state['failed_listings'] = [x for x in state.state['failed_listings']
-                                                  if x['id'] != f['id']]
-                state.save()
-            await asyncio.sleep(2)
-    finally:
-        if scraper.session:
-            await scraper.session.close()
-
-    logger.info(f"✓ Retry completed: {success}/{len(failed)} successful")
-
-
-def show_stats():
-    """Display statistics"""
-    state_file = Path("scraper_state.json")
-    csv_file = Path("arenda_listings.csv")
-
-    state = {}
-    if state_file.exists():
-        with open(state_file, 'r') as f:
-            state = json.load(f)
-
-    data = []
-    if csv_file.exists():
-        with open(csv_file, 'r', encoding='utf-8-sig') as f:
-            data = list(csv.DictReader(f))
-
-    print("=" * 80)
-    print("ARENDA.AZ SCRAPER STATISTICS")
-    print("=" * 80)
-    print(f"\n📊 SCRAPER STATE")
-    print("-" * 80)
-    print(f"Last Page:          {state.get('last_page', 0)}")
-    print(f"Total Scraped:      {state.get('total_scraped', 0)}")
-    print(f"Failed:             {len(state.get('failed_listings', []))}")
-    print(f"CSV Rows:           {len(data)}")
-
-    if not data:
-        return
-
-    # Property types
-    prop_types = Counter(r['property_type'] for r in data if r['property_type'])
-    print(f"\n🏠 PROPERTY TYPES")
-    print("-" * 80)
-    for ptype, count in prop_types.most_common(5):
-        print(f"{ptype:30} {count:>6} ({count/len(data)*100:.1f}%)")
-
-    # Prices
-    prices = []
-    for r in data:
-        try:
-            if r['price_azn']:
-                p = float(r['price_azn'].replace(' ', ''))
-                if p > 0:
-                    prices.append(p)
-        except:
-            pass
-
-    if prices:
-        print(f"\n💰 PRICES (AZN)")
-        print("-" * 80)
-        print(f"Average:            {sum(prices)/len(prices):,.0f}")
-        print(f"Min:                {min(prices):,.0f}")
-        print(f"Max:                {max(prices):,.0f}")
-        print(f"Median:             {sorted(prices)[len(prices)//2]:,.0f}")
-
-    # Rooms
-    rooms = Counter(r['rooms'] for r in data if r['rooms'])
-    print(f"\n🛏️  ROOMS")
-    print("-" * 80)
-    for room, count in sorted(rooms.items())[:5]:
-        print(f"{room} otaq:".ljust(20) + f"{count:>6}")
-
-    # Locations
-    locs = Counter(r['location'] for r in data if r['location'])
-    print(f"\n📍 TOP LOCATIONS")
-    print("-" * 80)
-    for loc, count in locs.most_common(10):
-        print(f"{loc[:50]:50} {count:>6}")
-
-    print("\n" + "=" * 80)
-
-
-def main():
-    """Main entry point"""
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python arenda_scraper.py scrape    # Start scraping")
-        print("  python arenda_scraper.py retry     # Retry failed listings")
-        print("  python arenda_scraper.py stats     # View statistics")
-        sys.exit(1)
-
-    command = sys.argv[1].lower()
-
-    if command == 'scrape':
-        logger.info("Starting scraper...")
-        scraper = ArendaScraper(max_concurrent=5)
-        asyncio.run(scraper.scrape())
-    elif command == 'retry':
-        logger.info("Retrying failed listings...")
-        asyncio.run(retry_failed())
-    elif command == 'stats':
-        show_stats()
-    else:
-        print(f"Unknown command: {command}")
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    main()
+    logger.info("Starting scraper...")
+    scraper = ArendaScraper(max_concurrent=5)
+    asyncio.run(scraper.scrape())
